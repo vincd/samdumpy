@@ -1,0 +1,244 @@
+from struct import unpack, pack
+from collections import namedtuple
+from Crypto.Hash import MD5
+from Crypto.Cipher import ARC4, DES
+
+NK_ID = 0x6B6E
+NK_ROOT = 0x2c
+
+NK_HDR = namedtuple('NK_HDR', 'id type t1 t2 unk1 parent_off subkey_num unk2 lf_off unk3 value_cnt value_off sk_off classname_off unk41 unk42 unk43 unk44 unk5 name_len classname_len key_name')
+LF_HDR = namedtuple('LF_HDR', 'id key_num hr')
+VK_HDR = namedtuple('VK_HDR', 'id name_len data_len data_off data_type flag unk1 value_name')
+HASH_RECORD = namedtuple('HASH_RECORD', 'nk_offset keyname')
+
+class RegHive(object):
+    def __init__(self, path):
+        with open(path, 'rb') as fd:
+            self.__base = fd.read()
+            self.__base = self.__base[0x1000:]
+
+        self.__root_key = self.regGetRootKey()
+
+    def regGetRootKey(self):
+        n = self.__read_nk(0x20)
+        return n if n.id == NK_ID and n.type == NK_ROOT else None
+
+    def regOpenKey(self, path):
+        n = self.__root_key
+        path_split = path.split('\\')
+
+        while len(path_split) > 0:
+            t = path_split.pop(0)
+            next_off = self.__parself(t, n.lf_off)
+
+            if next_off == -1: return None
+            n = self.__read_nk(next_off)
+
+        return n
+
+    def regQueryValue(self, n, value):
+        for i in self.__read_valuelist(n):
+            v = self.__read_vk(i)
+
+            if v.value_name == value or (v.flag & 1) == 0:
+                data_len = v.data_len & 0x0000FFFF
+                return v.data_off if data_len < 5 else self.__read_data(v.data_off, data_len)
+
+    def regEnumKey(self, nr):
+        for i in range(nr.subkey_num):
+            lf = self.__read_lf(nr.lf_off)
+            hr = self.__read_hr(lf.hr, i)
+            nk = self.__read_nk(hr.nk_offset)
+
+            yield nk.key_name
+
+    def __read_nk(self, offset):
+        n = NK_HDR._make(unpack('hhiiiiiiiiiiiiiiiiihhs', self.__base[offset+4:offset+4+77]))
+        n = n._replace(key_name=self.__base[offset+4+76:offset+4+76+n.name_len])
+
+        return n
+
+    def __read_lf(self, offset):
+        lf = LF_HDR._make(unpack('hhB', self.__base[offset+4:offset+4+5]))
+        lf = lf._replace(hr=offset+4+4)
+
+        return lf
+
+    def __read_hr(self, offset, index):
+        offset += 8 * index
+        hr = HASH_RECORD._make(unpack('i4s', self.__base[offset:offset+8]))
+
+        return hr
+
+    def __parself(self, t, offset):
+        l = self.__read_lf(offset)
+
+        for i in range(l.key_num):
+            hr = self.__read_hr(l.hr, i)
+            n = self.__read_nk(hr.nk_offset)
+
+            if t == n.key_name:
+                return hr.nk_offset
+
+        return -1
+
+    def __read_vk(self, offset):
+        vk = VK_HDR._make(unpack('hhiiihhs', self.__base[offset+4:offset+4+21]))
+        vk = vk._replace(value_name=self.__base[offset+4+20:offset+4+20+vk.name_len])
+        return vk
+
+    def __read_valuelist(self, n):
+        offset, size = n.value_off, n.value_cnt
+        return unpack('%si' % size, self.__base[offset + 4:offset + 4 + size*4])
+
+    def __read_data(self, offset, size):
+        return self.__base[offset+4:offset+4+size]
+
+    def read_data(self, n):
+        return self.__read_data(n.classname_off, n.classname_len)
+
+# Permutation matrix for boot key
+PERMUTATION_MATRIX = [ 0x8, 0x5, 0x4, 0x2, 0xb, 0x9, 0xd, 0x3,
+      0x0, 0x6, 0x1, 0xc, 0xe, 0xa, 0xf, 0x7 ]
+
+ODD_PARITY = [
+    1,  1,  2,  2,  4,  4,  7,  7,  8,  8, 11, 11, 13, 13, 14, 14,
+   16, 16, 19, 19, 21, 21, 22, 22, 25, 25, 26, 26, 28, 28, 31, 31,
+   32, 32, 35, 35, 37, 37, 38, 38, 41, 41, 42, 42, 44, 44, 47, 47,
+   49, 49, 50, 50, 52, 52, 55, 55, 56, 56, 59, 59, 61, 61, 62, 62,
+   64, 64, 67, 67, 69, 69, 70, 70, 73, 73, 74, 74, 76, 76, 79, 79,
+   81, 81, 82, 82, 84, 84, 87, 87, 88, 88, 91, 91, 93, 93, 94, 94,
+   97, 97, 98, 98,100,100,103,103,104,104,107,107,109,109,110,110,
+  112,112,115,115,117,117,118,118,121,121,122,122,124,124,127,127,
+  128,128,131,131,133,133,134,134,137,137,138,138,140,140,143,143,
+  145,145,146,146,148,148,151,151,152,152,155,155,157,157,158,158,
+  161,161,162,162,164,164,167,167,168,168,171,171,173,173,174,174,
+  176,176,179,179,181,181,182,182,185,185,186,186,188,188,191,191,
+  193,193,194,194,196,196,199,199,200,200,203,203,205,205,206,206,
+  208,208,211,211,213,213,214,214,217,217,218,218,220,220,223,223,
+  224,224,227,227,229,229,230,230,233,233,234,234,236,236,239,239,
+  241,241,242,242,244,244,247,247,248,248,251,251,253,253,254,254 ]
+
+def str_to_key(s):
+    key = [
+        ord(s[0])>>1,
+        ((ord(s[0])&0x01)<<6) | (ord(s[1])>>2),
+        ((ord(s[1])&0x03)<<5) | (ord(s[2])>>3),
+        ((ord(s[2])&0x07)<<4) | (ord(s[3])>>4),
+        ((ord(s[3])&0x0F)<<3) | (ord(s[4])>>5),
+        ((ord(s[4])&0x1F)<<2) | (ord(s[5])>>6),
+        ((ord(s[5])&0x3F)<<1) | (ord(s[6])>>7),
+        ord(s[6])&0x7F
+    ]
+
+    return ''.join(map(lambda k: chr(ODD_PARITY[k<<1]), key))
+
+def sid_to_key(sid):
+    s1 = ""
+    s1 += chr(sid & 0xFF)
+    s1 += chr((sid>>8) & 0xFF)
+    s1 += chr((sid>>16) & 0xFF)
+    s1 += chr((sid>>24) & 0xFF)
+    s1 += s1[0];
+    s1 += s1[1];
+    s1 += s1[2];
+    s2 = s1[3] + s1[0] + s1[1] + s1[2]
+    s2 += s2[0] + s2[1] + s2[2]
+
+    return str_to_key(s1), str_to_key(s2)
+
+def decrypt_single_hash(rid, hbootkey, enc_hash, apwd):
+    d1, d2 = map(lambda k: DES.new(k, DES.MODE_ECB), sid_to_key(rid))
+
+    rc4_key = MD5.new(hbootkey[:0x10] + pack('<L', rid) + apwd).digest()
+    obfkey = ARC4.new(rc4_key).encrypt(enc_hash)
+    hash = d1.decrypt(obfkey[:8]) + d2.decrypt(obfkey[8:])
+
+    return hash
+
+def get_bootkey(bootkeyFile):
+    h = RegHive(bootkeyFile)
+    n = h.regOpenKey('Select')
+    control = h.regQueryValue(n, 'Default')
+
+    reglsa = 'ControlSet%03d\\Control\\Lsa\\' % control
+    lsa_keys = ['JD', 'Skew1', 'GBG', 'Data']
+
+    bootkey = ''.join(map(lambda k: h.read_data(h.regOpenKey(reglsa + k)), lsa_keys))
+    bootkey = bootkey.decode('utf-16-le').decode('hex')
+    bootkey_scrambled = ''.join(map(lambda i: bootkey[PERMUTATION_MATRIX[i]], range(len(bootkey))))
+    return bootkey_scrambled
+
+def get_hbootkey(h, bootkey):
+    aqwerty = '!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\0'
+    anum = '0123456789012345678901234567890123456789\0'
+
+    regaccountkey = "SAM\\Domains\\Account"
+
+    # Open SAM\\SAM\\Domains\\Account key
+    n = h.regOpenKey(regaccountkey)
+    F = h.regQueryValue(n, "F")
+
+    # hash the bootkey
+    rc4_key = MD5.new(F[0x70:0x80] + aqwerty + bootkey + anum).digest()
+    hbootkey = ARC4.new(rc4_key).encrypt(F[0x80:0xA0])
+
+    return hbootkey
+
+def get_hashes(h, bootkey, hbootkey):
+    almpassword = 'LMPASSWORD\0'
+    antpassword = 'NTPASSWORD\0'
+    empty_lm = 'aad3b435b51404eeaad3b435b51404ee'
+    empty_nt = '31d6cfe0d16ae931b73c59d7e0c089c0'
+
+    root_key = h.regGetRootKey()
+    reguserskey = 'SAM\\Domains\\Account\\Users'
+    n = h.regOpenKey(reguserskey)
+
+    for regkeyname in h.regEnumKey(n):
+        if 'Names' in regkeyname: continue
+
+        keyname = reguserskey + '\\' + regkeyname
+        n = h.regOpenKey(keyname)
+        V = h.regQueryValue(n, 'V')
+
+        # rid
+        rid = int(regkeyname, 16)
+
+        # get the username
+        name_offset = unpack('<L', V[0x0c:0x10])[0] + 0xCC
+        name_length = unpack('<L', V[0x10:0x14])[0]
+        username = V[name_offset:name_offset+name_length].decode('utf-16-le')
+
+        # get the lm and ntlm hashes
+        hash_offset = unpack('<L', V[0x9c:0x9c+4])[0] + 0xCC
+
+        lm_exists = unpack('<L', V[0x9c+4:0x9c+8])[0] == 20
+        nt_exists = unpack('<L', V[0x9c+16:0x9c+20])[0] == 20
+
+        enc_lm_hash = V[hash_offset+4:hash_offset+20] if lm_exists else ''
+        enc_nt_hash = V[hash_offset+(24 if lm_exists else 8):hash_offset+(24 if lm_exists else 8)+16] if nt_exists else ''
+
+        lm_hash = decrypt_single_hash(rid, hbootkey, enc_lm_hash, almpassword) if lm_exists else empty_lm
+        ntlm_hash = decrypt_single_hash(rid, hbootkey, enc_nt_hash, antpassword).encode('hex') if nt_exists else empty_nt
+
+        print u':'.join([username, regkeyname, lm_hash, ntlm_hash])
+
+def main(argv):
+    if len(argv) != 3:
+        print 'Usage:\nsamdumpy SAM SYSTEM\n'
+        return
+
+    # Open bootkey file
+    boot_key = get_bootkey(argv[2])
+
+    # Initialize registry access function
+    h = RegHive(argv[1])
+    hboot_key = get_hbootkey(h, boot_key)
+
+    # list users and hashes
+    get_hashes(h, boot_key, hboot_key)
+
+if __name__ == "__main__":
+    import sys
+    main(sys.argv)
