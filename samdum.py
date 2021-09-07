@@ -1,7 +1,8 @@
 from struct import unpack, pack
+import binascii
 from collections import namedtuple
 from Crypto.Hash import MD5
-from Crypto.Cipher import ARC4, DES
+from Crypto.Cipher import ARC4, DES, AES
 
 NK_ID = 0x6B6E
 NK_ROOT = 0x2c
@@ -25,12 +26,11 @@ class RegHive(object):
 
     def regOpenKey(self, path):
         n = self.__root_key
-        path_split = path.split('\\')
+        path_split = path.split(b'\\')
 
         while len(path_split) > 0:
             t = path_split.pop(0)
             next_off = self.__parself(t, n.lf_off)
-
             if next_off == -1: return None
             n = self.__read_nk(next_off)
 
@@ -76,7 +76,6 @@ class RegHive(object):
         for i in range(l.key_num):
             hr = self.__read_hr(l.hr, i)
             n = self.__read_nk(hr.nk_offset)
-
             if t == n.key_name:
                 return hr.nk_offset
 
@@ -131,7 +130,7 @@ def str_to_key(s):
         ord(s[6])&0x7F
     ]
 
-    return ''.join(map(lambda k: chr(ODD_PARITY[k<<1]), key))
+    return bytes(map(lambda k: ODD_PARITY[k<<1], key))
 
 def sid_to_key(sid):
     s1 = ""
@@ -156,88 +155,156 @@ def decrypt_single_hash(rid, hbootkey, enc_hash, apwd):
 
     return hash
 
+def get_current_controlSet(registry_hive):
+    n = registry_hive.regOpenKey(b'Select')
+    currentControlSet = ''
+
+    for source in [b'Current', b'Default']:
+        controlSet = registry_hive.regQueryValue(n, source)
+        if controlSet:
+            currentControlSet = b'ControlSet%03d\\Control\\Lsa\\' % controlSet
+            break
+
+    return currentControlSet
+
 def get_bootkey(bootkeyFile):
     h = RegHive(bootkeyFile)
-    n = h.regOpenKey('Select')
-    control = h.regQueryValue(n, 'Default')
+    current_controlset = get_current_controlSet(h)
 
-    reglsa = 'ControlSet%03d\\Control\\Lsa\\' % control
-    lsa_keys = ['JD', 'Skew1', 'GBG', 'Data']
+    lsa_keys = [b'JD', b'Skew1', b'GBG', b'Data']
 
-    bootkey = ''.join(map(lambda k: h.read_data(h.regOpenKey(reglsa + k)), lsa_keys))
-    bootkey = bootkey.decode('utf-16-le').decode('hex')
-    bootkey_scrambled = ''.join(map(lambda i: bootkey[PERMUTATION_MATRIX[i]], range(len(bootkey))))
+    bootkey = b''
+    for k in lsa_keys:
+        rr = h.read_data(h.regOpenKey(current_controlset + k))
+        bootkey += rr
+
+    bootkey = binascii.unhexlify(str(object=bootkey, encoding='utf-16-le'))
+    bootkey_scrambled = bytes(map(lambda i: bootkey[PERMUTATION_MATRIX[i]], range(len(bootkey))))
     return bootkey_scrambled
 
-def get_hbootkey(h, bootkey):
-    aqwerty = '!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\0'
-    anum = '0123456789012345678901234567890123456789\0'
+def get_hbootkey(h, sys_key):
+    aqwerty = b'!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\x00'
+    anum = b'0123456789012345678901234567890123456789\x00'
 
-    regaccountkey = "SAM\\Domains\\Account"
+    regaccountkey = b'SAM\\Domains\\Account'
 
     # Open SAM\\SAM\\Domains\\Account key
     n = h.regOpenKey(regaccountkey)
-    F = h.regQueryValue(n, "F")
+    domain_account_f = h.regQueryValue(n, b"F")
 
-    # hash the bootkey
-    rc4_key = MD5.new(F[0x70:0x80] + aqwerty + bootkey + anum).digest()
-    hbootkey = ARC4.new(rc4_key).encrypt(F[0x80:0xA0])
+    print(domain_account_f.hex())
+    if domain_account_f[0] != 2 and domain_account_f[0] != 3:
+        raise Exception(f'Unknow F revision {domain_account_f[0]}')
 
-    return hbootkey
+    keys1 = domain_account_f[0x68:0xA8]
+    print(keys1.hex())
+    if keys1[0] == 0x01:
+        # hash the sys_key
+        key1_salt = keys1[0x08:0x18]
+        rc4_key = MD5.new(key1_salt + aqwerty + sys_key + anum).digest()
+        sam_key = ARC4.new(rc4_key).encrypt(keys1[0x18:0x28])
+        return sam_key
 
-def get_hashes(h, bootkey, hbootkey):
-    almpassword = 'LMPASSWORD\0'
-    antpassword = 'NTPASSWORD\0'
+    elif keys1[0] == 0x02:
+        aes_salt = keys1[0x10:0x20]
+        aes_data = keys1[0x20:0x30]
+        aes = AES.new(sys_key, AES.MODE_CBC, iv=aes_salt)
+        sam_key = aes.decrypt(aes_data)
+        return sam_key
+    else:
+        raise Exception(f'Unknow Struct Key revision {keys1[0]}')
+
+
+def decrypt_hash(rid, encrypted_hash):
+        d1, d2 = map(lambda k: DES.new(k, DES.MODE_ECB), sid_to_key(rid))
+        decrypted_hash = d1.decrypt(encrypted_hash[:8]) + d2.decrypt(encrypted_hash[8:])
+        return decrypted_hash.hex()
+
+def get_hash(sam_key, user_account, rid, offset, password_salt):
+    hash_entry_offet = unpack('<L', user_account[0x0c*offset:0x0c*offset+4])[0] + 0xcc
+    hash_entry_length = unpack('<L', user_account[0x0c*offset+4:0x0c*offset+8])[0]
+    hash_entry = user_account[hash_entry_offet:hash_entry_offet+hash_entry_length]
+    print(hash_entry[2], hash_entry_offet - 0xcc, hash_entry_length, hash_entry.hex())
+
+    if hash_entry[2] == 1:
+        xx = sam_key[:0x10] + pack('<L', rid) + password_salt
+        rc4_key = MD5.new(xx).digest()
+        encrypted_hash = ARC4.new(rc4_key).encrypt(hash_entry[4:20])
+        return decrypt_hash(rid, encrypted_hash[:16])
+
+    elif hash_entry[2] == 2:
+        aes_salt = hash_entry[0x08:0x18]
+        aes = AES.new(sam_key, AES.MODE_CBC, aes_salt)
+        encrypted_hash = aes.decrypt(hash_entry[0x18:])
+        return decrypt_hash(rid, encrypted_hash[:16])
+
+    else:
+        raise Exception(f'Unknow SAM_HASH revision {hash_entry[2]}')
+
+    return hash_entry
+
+
+def get_hashes(h, sam_key):
+    almpassword = b'LMPASSWORD\0'
+    antpassword = b'NTPASSWORD\0'
     empty_lm = 'aad3b435b51404eeaad3b435b51404ee'
     empty_nt = '31d6cfe0d16ae931b73c59d7e0c089c0'
 
     root_key = h.regGetRootKey()
-    reguserskey = 'SAM\\Domains\\Account\\Users'
+    reguserskey = b'SAM\\Domains\\Account\\Users'
     n = h.regOpenKey(reguserskey)
 
     for regkeyname in h.regEnumKey(n):
-        if 'Names' in regkeyname: continue
+        if b'Names' in regkeyname: continue
 
-        keyname = reguserskey + '\\' + regkeyname
+        keyname = reguserskey + b'\\' + regkeyname
         n = h.regOpenKey(keyname)
-        V = h.regQueryValue(n, 'V')
+        user_account = h.regQueryValue(n, b'V')
+        user_account_data_offet = 0xcc
 
         # rid
         rid = int(regkeyname, 16)
 
         # get the username
-        name_offset = unpack('<L', V[0x0c:0x10])[0] + 0xCC
-        name_length = unpack('<L', V[0x10:0x14])[0]
-        username = V[name_offset:name_offset+name_length].decode('utf-16-le')
+        name_offset = unpack('<L', user_account[0x0c:0x10])[0] + user_account_data_offet
+        name_length = unpack('<L', user_account[0x10:0x14])[0]
+        print(name_offset, name_length)
+        username = user_account[name_offset:name_offset+name_length].decode('utf-16-le')
 
-        # get the lm and ntlm hashes
-        hash_offset = unpack('<L', V[0x9c:0x9c+4])[0] + 0xCC
 
-        lm_exists = unpack('<L', V[0x9c+4:0x9c+8])[0] == 20
-        nt_exists = unpack('<L', V[0x9c+16:0x9c+20])[0] == 20
+        print(username)
+        print(user_account[0xcc:].hex())
+        print('  NT hash:', get_hash(sam_key, user_account, rid, 13, almpassword))
+        print('  NTLM hash:', get_hash(sam_key, user_account, rid, 14, antpassword))
+        print('  NT hash history:', get_hash(sam_key, user_account, rid, 15, almpassword))
+        print('  NTLM hash history:', get_hash(sam_key, user_account, rid, 16, antpassword))
 
-        enc_lm_hash = V[hash_offset+4:hash_offset+20] if lm_exists else ''
-        enc_nt_hash = V[hash_offset+(24 if lm_exists else 8):hash_offset+(24 if lm_exists else 8)+16] if nt_exists else ''
+        # print(user_account[0x9c+4:0x9c+8], user_account[0x9c+16:0x9c+20], hash_offset)
+        # enc_lm_hash = user_account[hash_offset+4:hash_offset+20] if lm_exists else ''
+        # enc_nt_hash = user_account[hash_offset+(24 if lm_exists else 8):hash_offset+(24 if lm_exists else 8)+16] if nt_exists else ''
 
-        lm_hash = decrypt_single_hash(rid, hbootkey, enc_lm_hash, almpassword) if lm_exists else empty_lm
-        ntlm_hash = decrypt_single_hash(rid, hbootkey, enc_nt_hash, antpassword).encode('hex') if nt_exists else empty_nt
+        # lm_hash = decrypt_single_hash(rid, sam_key, enc_lm_hash, almpassword) if lm_exists else empty_lm
+        # ntlm_hash = decrypt_single_hash(rid, sam_key, enc_nt_hash, antpassword).encode('hex') if nt_exists else empty_nt
 
-        print u':'.join([username, regkeyname, lm_hash, ntlm_hash])
+        # print(':'.join([username, str(int(regkeyname.decode('utf-8'), 16)), lm_hash, ntlm_hash]))
 
 def main(argv):
     if len(argv) != 3:
-        print 'Usage:\nsamdumpy SAM SYSTEM\n'
+        print('Usage:\nsamdumpy SAM SYSTEM\n')
         return
 
     # Open bootkey file
-    boot_key = get_bootkey(argv[2])
+    sys_key = get_bootkey(argv[2])
+    print(f'SysKey: {sys_key.hex()}')
 
     # Initialize registry access function
     h = RegHive(argv[1])
-    hboot_key = get_hbootkey(h, boot_key)
+    sam_key = get_hbootkey(h, sys_key)
+    print(f'SamKey: {sam_key.hex()}')
 
     # list users and hashes
-    get_hashes(h, boot_key, hboot_key)
+    get_hashes(h, sam_key)
+
 
 if __name__ == "__main__":
     import sys
